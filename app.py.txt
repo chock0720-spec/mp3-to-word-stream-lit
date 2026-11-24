@@ -1,0 +1,234 @@
+import os
+import re
+import tempfile
+
+import streamlit as st
+import whisper
+from opencc import OpenCC
+from docx import Document
+from docx.shared import Pt
+
+
+st.set_page_config(
+    page_title="MP3 轉 Word（繁體中文）",
+    page_icon="🎧",
+    layout="centered"
+)
+
+st.title("🎧 MP3 語音轉 Word")
+st.caption(
+    "上傳 MP3，自動轉錄為繁體中文、補上標點、依句末標點分段，"
+    "並下載 Word 檔。"
+)
+
+st.divider()
+
+
+@st.cache_resource(show_spinner="正在載入 Whisper 模型，第一次需要下載，請稍候……")
+def load_whisper_model(model_name):
+    return whisper.load_model(model_name)
+
+
+@st.cache_resource(show_spinner="正在載入中文標點補回模型……")
+def load_punctuation_model():
+    from funasr import AutoModel
+
+    return AutoModel(
+        model="funasr/ct-punc",
+        hub="hf",
+        device="cpu"
+    )
+
+
+def has_chinese_punctuation(text):
+    punctuation = "。！？；，、："
+    return any(mark in text for mark in punctuation)
+
+
+def restore_punctuation(text):
+    model = load_punctuation_model()
+    result = model.generate(input=text)
+    return result[0]["text"].strip()
+
+
+def convert_to_traditional_chinese(text):
+    converter = OpenCC("s2t")
+    return converter.convert(text).strip()
+
+
+def split_into_paragraphs(text):
+    text = re.sub(r"([。！？；!?;])\s*", r"\1\n", text)
+
+    paragraphs = []
+    for paragraph in text.split("\n"):
+        paragraph = paragraph.strip()
+        if paragraph:
+            paragraphs.append(paragraph)
+
+    return paragraphs
+
+
+def create_word_document(paragraphs, original_filename):
+    document = Document()
+
+    style = document.styles["Normal"]
+    style.font.name = "Microsoft JhengHei"
+    style.font.size = Pt(12)
+
+    document.add_heading("語音轉文字紀錄", level=1)
+    document.add_paragraph(f"來源音檔：{original_filename}")
+    document.add_paragraph("")
+    document.add_heading("轉錄內容", level=2)
+
+    if paragraphs:
+        for paragraph in paragraphs:
+            document.add_paragraph(paragraph)
+    else:
+        document.add_paragraph("沒有可輸出的轉錄內容。")
+
+    output_path = os.path.join(
+        tempfile.gettempdir(),
+        "語音轉文字.docx"
+    )
+
+    document.save(output_path)
+    return output_path
+
+
+with st.sidebar:
+    st.header("設定")
+
+    model_name = st.selectbox(
+        "Whisper 模型",
+        options=[
+            "tiny",
+            "base",
+            "small",
+            "medium",
+            "large-v3",
+            "turbo"
+        ],
+        index=1,
+        help=(
+            "tiny/base 較快；small/medium 較準確；"
+            "large-v3 最準確但最耗資源；turbo 兼顧速度與準確度。"
+        )
+    )
+
+    language = st.selectbox(
+        "語音語言",
+        options=["中文", "廣東話", "英文", "自動判斷"],
+        index=0
+    )
+
+    auto_punctuation = st.checkbox(
+        "缺少標點時自動補回標點",
+        value=True,
+        help="使用 FunASR ct-punc 為沒有標點的轉錄文字補回標點。"
+    )
+
+st.divider()
+
+uploaded_file = st.file_uploader(
+    "上傳 MP3 檔案",
+    type=["mp3", "wav", "m4a"],
+    accept_multiple_files=False
+)
+
+if uploaded_file is None:
+    st.info("請先上傳 MP3 檔案。")
+    st.stop()
+
+st.success(f"已選擇檔案：{uploaded_file.name}")
+
+if st.button("開始轉錄並產生 Word", type="primary", use_container_width=True):
+    if language == "中文":
+        whisper_language = "zh"
+    elif language == "廣東話":
+        whisper_language = "zh"
+    elif language == "英文":
+        whisper_language = "en"
+    else:
+        whisper_language = None
+
+    initial_prompt = (
+        "以下是繁體中文的會議錄音逐字稿。"
+        "請使用繁體中文，並加入適當的標點符號，例如逗號、句號、問號。"
+        "請依照語意自然斷句。"
+    )
+
+    with tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=os.path.splitext(uploaded_file.name)[1]
+    ) as temporary_audio:
+        temporary_audio.write(uploaded_file.getvalue())
+        audio_path = temporary_audio.name
+
+    try:
+        model = load_whisper_model(model_name)
+
+        transcribe_arguments = {
+            "task": "transcribe",
+            "verbose": False
+        }
+
+        if whisper_language is not None:
+            transcribe_arguments["language"] = whisper_language
+
+        if whisper_language == "zh":
+            transcribe_arguments["initial_prompt"] = initial_prompt
+
+        with st.spinner("正在轉錄語音，請稍候……"):
+            result = model.transcribe(audio_path, **transcribe_arguments)
+
+        raw_text = result["text"].strip()
+
+        st.subheader("Whisper 原始轉錄")
+        st.text_area(
+            "原始文字",
+            value=raw_text,
+            height=220
+        )
+
+        if auto_punctuation and not has_chinese_punctuation(raw_text):
+            with st.spinner("正在補回標點符號……"):
+                text_with_punctuation = restore_punctuation(raw_text)
+        else:
+            text_with_punctuation = raw_text
+
+        traditional_text = convert_to_traditional_chinese(
+            text_with_punctuation
+        )
+
+        paragraphs = split_into_paragraphs(traditional_text)
+
+        st.subheader("繁體中文與分段結果")
+        st.text_area(
+            "最終文字",
+            value="\n\n".join(paragraphs),
+            height=320
+        )
+
+        word_path = create_word_document(
+            paragraphs=paragraphs,
+            original_filename=uploaded_file.name
+        )
+
+        with open(word_path, "rb") as word_file:
+            st.download_button(
+                label="⬇️ 下載 Word 檔",
+                data=word_file.read(),
+                file_name="語音轉文字.docx",
+                mime=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "wordprocessingml.document"
+                ),
+                use_container_width=True
+            )
+
+    except Exception as error:
+        st.error(f"處理時發生錯誤：{error}")
+
+    finally:
+        if os.path.exists(audio_path):
+            os.remove(audio_path)
